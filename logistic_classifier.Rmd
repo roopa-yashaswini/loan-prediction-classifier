@@ -1,0 +1,859 @@
+---
+title: "Workshop II: Classification with Logistic Regression"
+author: "Roopa Yashaswini Kotha"
+date: October 2024
+output:
+  html_document:
+    theme: journal
+    highlight: tango
+    number_sections: yes
+    toc: yes
+    toc_float: no
+    mathjax: "default"
+  pdf_document:
+    toc: yes
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, load_libraries, include = FALSE}
+library(tidyverse) # the usual stuff: dplyr, readr, and other goodies
+library(lubridate) # to handle dates
+library(GGally) # for correlation-scatter plot matrix
+library(ggfortify) # to produce residual diagnostic plots
+library(rsample) # to split dataframe in training- & testing sets
+library(janitor) # clean_names()
+library(broom) # use broom:augment() to get tidy table with regression output, residuals, etc
+library(huxtable) # to get summary table of all models produced
+library(caret) # to train more advanced models (k-fold cross-validation, stepwise regression, LASSO)
+library(nnet) # to calculate the maximum value of a vector
+library(pROC) # to plot ROC curves
+library(sampling)
+library(MLmetrics) #for caret LASSO logistic regression
+library(data.table)
+library(glmnet)
+
+```
+
+# Introduction
+
+## Load the data
+
+First we need to start by loading the data.
+
+```{r, load_data, warning=FALSE, message=FALSE}
+
+lc_raw <- read_csv("LendingClub Data.csv",  skip=1) %>%  
+  clean_names() # use janitor::clean_names()
+```
+
+# ICE the data: Inspect, Clean, Explore
+
+## Inspect the data
+
+```{r, Inspect}
+glimpse(lc_raw)
+```
+
+## Clean the data
+
+```{r, clean data}
+lc_clean<- lc_raw %>%
+  select(-where(~ mean(is.na(.)) > 0.9)) %>% # drop columns with more than 90% missing data
+  filter(!is.na(int_rate)) %>%   #delete empty rows
+  mutate(
+    issue_d = mdy(issue_d),  # lubridate::mdy() to fix date format
+    term = factor(term_months),     # turn 'term' into a categorical variable
+    delinq_2yrs = factor(delinq_2yrs) # turn 'delinq_2yrs' into a categorical variable
+  ) %>% 
+  mutate(default = dplyr::recode(loan_status, 
+                      "Charged Off" = "1", 
+                      "Fully Paid" = "0"))%>%
+    mutate(default = as.factor(default)) %>%
+  dplyr::select(-emp_title,-installment, -term_months, everything()) #move some not-so-important variables to the end. 
+    
+```
+
+## Explore the data **(Q1)**
+
+```{r, visualization of defaults, warning=FALSE}
+#bar chart of defaults
+def_vis1 <- ggplot(data=lc_clean, aes(x=default)) +
+  geom_bar(aes(y = (..count..)/sum(..count..))) + 
+  labs(x="Default, 1=Yes, 0=No", y="relative frequencies") +
+  scale_y_continuous(labels=scales::percent) +
+  geom_text(aes( label = scales::percent((..count..)/sum(..count..) ),y=(..count..)/sum(..count..) ), stat= "count",vjust=-0.5) 
+
+def_vis1
+
+#bar chart of defaults per loan grade
+def_vis2 <- ggplot(data=lc_clean, aes(x=default), group=grade) +
+  geom_bar(aes(y = (..count..)/sum(..count..), fill = factor(..x..)), stat="count")  + 
+  labs(title="Defaults by Grade", x="Default, 1=Yes, 0=No", y="relative frequencies")+
+  scale_y_continuous(labels=scales::percent) +facet_grid(~grade) + theme(legend.position = "none") +
+  geom_text(aes( label = scales::percent((..count..)/sum(..count..) ),y=(..count..)/sum(..count..) ), stat= "count",vjust=-0.5) 
+def_vis2
+
+#bar chart of defaults per number of Delinquencies
+def_vis3 <- lc_clean %>%
+  filter(as.numeric(delinq_2yrs)<4) %>%
+  ggplot(aes(x=default), group=delinq_2yrs) +
+  geom_bar(aes(y = (..count..)/sum(..count..), fill = factor(..x..)), stat="count")  + 
+  labs(title="Defaults by Number of Delinquencies", x="Default, 1=Yes, 0=No", y="relative frequencies")  +
+  scale_y_continuous(labels=scales::percent) +facet_grid(~delinq_2yrs) + theme(legend.position = "none") +
+  geom_text(aes( label = scales::percent((..count..)/sum(..count..) ),y=(..count..)/sum(..count..) ), stat= "count",vjust=-0.5)
+
+def_vis3
+
+#scatter plots 
+
+#We select 2000 random loans to display only to make the display less busy. 
+set.seed(1234)
+reduced<-lc_clean[sample(0:nrow(lc_clean), 2000, replace = FALSE),]%>%
+  mutate(default=as.numeric(default)-1) # also convert default to a numeric {0,1} to make it easier to plot.
+
+          
+# scatter plot of defaults against loan amount  
+# If the jitter plot does not show up, try to remove I() and simply use x=loan_amnt/1000
+def_vis4 <- ggplot(data=reduced, aes(y=default,x=I(loan_amnt/1000)))  + 
+  labs(y="Default, 1=Yes, 0=No", x="Loan Amnt (1000 $)") +
+  geom_jitter(width=0, height=0.05, alpha=0.7) #We use jitter to offset the display of defaults/non-defaults to make the data easier to interpert. We have also changed the amount to 1000$ to reduce the number of zeros on the horizontal axis.
+
+def_vis4
+
+#scatter plot of defaults against loan amount.
+def_vis5 <- ggplot(data=reduced, aes(y=default,x=I(annual_inc/1000)))   + labs(y="Default, 1=Yes, 0=No", x="Annual Income(1000 $)") +geom_jitter(width=0, height=0.05, alpha=0.7) +  xlim(0,400)
+
+def_vis5
+
+```
+
+We also estimate a correlation table between defaults and other
+continuous variables.
+
+```{r, correlation table, warning=FALSE, message=FALSE}
+
+# correlation table using GGally::ggcor()
+# this takes a while to plot
+
+lc_clean %>% 
+    mutate(default=as.numeric(default)-1)%>%
+  select(loan_amnt, dti, annual_inc, default) %>% #keep Y variable last
+ ggcorr(method = c("pairwise", "pearson"), label_round=2, label = TRUE)
+
+```
+
+```{r, eval = TRUE}
+# My visualization
+# Load the data and define interest rate groups
+lc_clean %>% 
+  mutate(
+    # Create a new variable 'int_group' that categorizes 'int_rate' into ranges
+    int_group = cut(int_rate, breaks = c(0.05, 0.10, 0.15, 0.20, 0.25), 
+                    labels = c("5%-10%", "10%-15%", "15%-20%", "20%-25$%"))
+  ) %>% 
+  # Start ggplot with 'default' on x-axis, grouping by 'int_group'
+  ggplot(aes(x = default), group = int_group) +
+  
+  # Create a bar plot showing the proportion of defaults within each group
+  geom_bar(aes(y = (..count..) / sum(..count..), fill = factor(..x..)), stat = "count")  + 
+  
+  # Add labels and title for the plot
+  labs(
+    title = "Defaults by Interest Rate", 
+    x = "Default, 1=Yes, 0=No", 
+    y = "Relative Frequencies"
+  )  +
+  
+  # Convert y-axis values to percentages for easier interpretation
+  scale_y_continuous(labels = scales::percent) +
+  
+  # Create separate panels (facets) for each 'int_group' category
+  facet_grid(~int_group) + 
+  
+  # Remove the legend for a cleaner look
+  theme(legend.position = "none") +
+  
+  # Display percentage labels on top of each bar
+  geom_text(
+    aes(label = scales::percent((..count..) / sum(..count..)), 
+        y = (..count..) / sum(..count..)), 
+    stat = "count",
+    vjust = -0.5
+  )
+
+```
+
+The above visualisation provides a bar chart on the percentage of
+defaults based on the interest rates where the interest rates are
+grouped with an interval of 5%. From the above chart, maximum people
+were lent loans with interest rate of 10-15% and has the highest
+defaults as well.
+
+# Linear vs. logistic regression for binary response variables **(Q2)**
+
+It is certainly possible to use the OLS approach to find the line that
+minimizes the sum of squared errors when the dependent variable is
+binary (i.e., default / no default). In this case, the predicted values
+take the interpretation of a probability. We can also estimate a
+logistic regression instead. We do both below.
+
+```{r, linear and logistic regression with binary response variable, warning=FALSE}
+
+model_lm<-lm(as.numeric(default)~I(annual_inc/1000), lc_clean)
+summary(model_lm)
+
+
+logistic1<-glm(default~I(annual_inc/1000), family="binomial", lc_clean)
+summary(logistic1)
+
+
+ggplot(data=reduced, aes(x=annual_inc/1000, y=default)) + 
+  geom_smooth(method="lm", se=0, aes(color="OLS"))+ 
+  geom_smooth(method = "glm", method.args = list(family = "binomial"),  se=0, aes(color="Logistic"))+ 
+  labs(y="Prob of Default", x="Annual Income(1000 $)")+  
+  xlim(0,450)+scale_y_continuous(labels=scales::percent)+geom_jitter(width=0, height=0.05, alpha=0.7) + 
+  scale_colour_manual(name="Fitted Model", values=c("blue", "red"))
+
+```
+
+Logistic regression is better model because linear regression is useful
+for predicting values and can predict probabilities less than 0 or
+higher than 1 which is not correct. In the graph above, the linear model
+line goes below 0%. However, the logistic regression predicts the
+probabilities in correct range, making it easier to classify.
+
+# Multivariate logistic regression **(Q3, Q4)**
+
+```{r, multivariate logistic regression, warning=FALSE, eval = TRUE}
+logistic2<- glm(default~annual_inc + term + grade + loan_amnt, family="binomial", lc_clean)
+summary(logistic2)
+
+#compare the fit of logistic 1 and logistic 2
+anova(logistic1,logistic2)
+
+```
+
+Logistic 2 model is better because it allocates more variables that
+reduces the deviance from 31130 to 29286.
+
+```{r, eval = TRUE}
+#Predict the probability of default
+prob_default<-predict(logistic2,lc_clean,type="response")
+
+#plot 1: Density of predictions
+g0<-ggplot( lc_clean, aes( prob_default ) )+
+  geom_density( size=1)+
+  ggtitle( "Predicted Probability with Logistic 2" )+  
+  xlab("Estimated Probability")
+g0
+
+#plot 2: Density of predictions by default
+g1<-ggplot( lc_clean, aes( prob_default, color=default) ) +
+  geom_density( size=1)+
+  ggtitle( "Predicted Probability with Logistic 2 by Default" )+  
+  xlab("Estimated Probability")
+g1
+```
+
+## From probability to classification
+
+The logistic regression model gives us a sense of how likely defaults
+are; it gives us a probability estimate. To convert this into a
+prediction, we need to choose a cutoff probability and classify every
+loan with a predicted probability of default above the cutoff as a
+prediction of default (and vice versa for loans with a predicted
+probability below this cutoff).
+
+Let's choose a threshold of 16%. Of course some of our predictions will
+turn out to be right but some will turn out to be wrong -- you can see
+this in the density figures of the previous section. Let's call
+"default" the "positive" class since this is the class we are trying to
+predict. We could be making two types of mistakes. False positives
+(*i.e.,* predict that a loan will default when it will not) and false
+negatives (*i.e.,* predict that a loan will not default when it does).
+These errors are summarized in the confusion matrix.
+
+```{r, From probability to classification, eval = TRUE}
+#using the logistic 2 model predict default probabilities
+prob_default2<- predict(logistic2,lc_clean,type="response")
+
+#Call any loan with probability more than 16% as default and any loan with lower probability as non-default. Make sure your prediction is a factor with the same levels as the default variable in the lc_clean data frame
+p_class<- ifelse(prob_default2 >= 0.16, "1", "0")     
+
+#produce the confusion matrix and set default as the positive outcome
+con2<- confusionMatrix(as.factor(p_class), as.factor(lc_clean$default), positive="1")         
+
+#print the confusion matrix
+con2
+
+```
+
+> **Q7**. Testing the cutoff to be 20%.
+
+```{r, From probability to classification v2, eval = TRUE}
+p_class_updated<- ifelse(prob_default2 >= 0.20, "1", "0") # insert your code
+
+#produce the confusion matrix and set default as the positive outcome
+con2_updated<- confusionMatrix(as.factor(p_class_updated), as.factor(lc_clean$default), positive="1") # insert your code
+  
+#print the confusion matrix
+con2_updated
+
+```
+
+20% cutoff has higher accuracy and low sensitivity. However, in the case
+of lending club, since predicting defaults is very important, 16% cutoff
+which provides higher sensitivity is better.
+
+```{r, ROC curves, warning=FALSE, eval = TRUE}
+# Calculate the ROC curve for 'logistic2' model
+# 'roc' function takes the actual default outcomes and predicted probabilities of default (prob_default2)
+ROC_logistic2 <- roc(lc_clean$default, prob_default2)
+
+# Estimate the Area Under the Curve (AUC) for the 'logistic2' model
+# Extract the AUC from the ROC object and store it in 'AUC2'
+AUC2 <- ROC_logistic2$auc
+
+# Plot the ROC curve with the ggroc function and display the AUC in the plot title
+ggroc(ROC_logistic2, alpha = 0.5) + 
+  
+  # Add a title to the plot, embedding the AUC value rounded to two decimal places
+  ggtitle(paste("Model Logistic 2: AUC =", round(AUC2 * 100, digits = 2), "%"))  +
+  
+  # Add a dashed diagonal line representing a random classifier (where TPR = FPR)
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "grey", linetype = "dashed") +
+  
+  # Add dashed segments for the x and y-axis extremes (TPR = 1 and FPR = 1) for clearer reference
+  geom_segment(aes(x = 1, xend = 1, y = 0, yend = 1), color = "black", linetype = "dashed") +
+  geom_segment(aes(x = 1, xend = 0, y = 1, yend = 1), color = "black", linetype = "dashed")
+
+
+```
+
+```{r, out-of-sample ROC curve, eval = TRUE}
+# splitting the data into training and testing
+set.seed(24)
+train_test_split <- initial_split(lc_clean, prop = 0.8)
+testing <- testing(train_test_split) #20% of the data is set aside for testing
+training <- training(train_test_split) #80% of the data is set aside for training
+
+# run logistic 2 on the training set 
+logistic2<- glm(default~annual_inc + term + grade + loan_amnt, family="binomial", training)            # insert your code
+
+#calculate probability of default in the training sample 
+p_in<- predict(logistic2, training, type="response")             
+  
+#ROC curve using in-sample predictions
+ROC_logistic2_in <- roc(training$default, p_in)  
+
+#AUC using in-sample predictions
+AUC_logistic2_in<- ROC_logistic2_in$auc 
+  
+#calculate probability of default out of sample 
+p_out<- predict(logistic2, testing, type="response")  
+
+#ROC curve using out-of-sample predictions
+ROC_logistic2_out <- roc(testing$default, p_out)           
+AUC_logistic2_out<- ROC_logistic2_out$auc 
+  
+#plot in the same figure both ROC curves and print the AUC of both curves in the title
+ggroc(list("Logistic 2 In"=ROC_logistic2_in, "Logistic 2 Out"=ROC_logistic2_out))+
+  ggtitle(
+    paste("Model Logistic 2 In: AUC=",round(AUC_logistic2_in*100, digits=2),
+          "%\nModel Logistic 2 Out: AUC=",round(AUC_logistic2_out*100, digits=2),
+          "%")
+  )+
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color="grey", linetype="dashed")
+```
+
+There is no evidence of overfitting because the AUC for both training
+and testing sample are nearly same. If the AUC for testing is very less
+than training, there could be a chance of over-fitting.
+
+```{r, out-of-sample ROC curve overfitting, eval = TRUE}
+
+#add code here
+# Set random seed for reproducibility
+set.seed(123)
+
+# Store the number of rows in the data
+n <- nrow(lc_clean)
+
+# Generate 500 random predictor variables and add them to the dataset
+for (i in 1:500) {
+  # Create a new column "random_var_i" for each iteration with random normal values (mean=0, sd=100)
+  lc_clean[[paste0("random_var_", i)]] <- rnorm(n, mean = 0, sd = 100)
+}
+
+# Set another seed to ensure reproducible train-test splitting
+set.seed(24)
+
+# Split data into training (80%) and testing (20%) sets
+train_test_split <- initial_split(lc_clean, prop = 0.8)
+testing_random <- testing(train_test_split)       # 20% of the data for testing
+training_random <- training(train_test_split)     # 80% of the data for training
+
+# Specify the predictors, including original and 500 random variables
+predictors <- paste(
+  c("annual_inc", "term", "grade", "loan_amnt", paste0("random_var_", 1:500)), 
+  collapse = " + "
+)
+
+# Create the formula for the logistic regression model
+formula <- as.formula(paste("default ~", predictors))
+
+# Train a logistic regression model on the training set
+logistic_model <- glm(formula, family = "binomial", data = training_random)
+
+# Make in-sample predictions on the training set
+p_random_in <- predict(logistic_model, training_random, type = "response")
+
+# Generate the ROC curve for in-sample predictions
+ROC_logistic_random_in <- roc(training_random$default, p_random_in)
+
+# Calculate the AUC for the in-sample ROC curve
+AUC_logistic_random_in <- ROC_logistic_random_in$auc
+
+# Make out-of-sample predictions on the testing set
+p_random_out <- predict(logistic_model, testing_random, type = "response")
+
+# Generate the ROC curve for out-of-sample predictions
+ROC_logistic_random_out <- roc(testing_random$default, p_random_out)
+
+# Calculate the AUC for the out-of-sample ROC curve
+AUC_logistic_random_out <- ROC_logistic_random_out$auc
+
+# Plot both ROC curves (in-sample and out-of-sample) on the same plot
+ggroc(list("Logistic 2 In" = ROC_logistic_random_in, "Logistic 2 Out" = ROC_logistic_random_out)) +
+  
+  # Add a title showing the AUC values for both curves
+  ggtitle(
+    paste(
+      "Model Logistic Random In: AUC=", round(AUC_logistic_random_in * 100, digits = 2), "%",
+      "\nModel Logistic Random Out: AUC=", round(AUC_logistic_random_out * 100, digits = 2), "%"
+    )
+  ) +
+  
+  # Add a diagonal dashed line (random classifier baseline)
+  geom_segment(aes(x = 1, xend = 0, y = 0, yend = 1), color = "grey", linetype = "dashed")
+
+```
+
+The difference between AUC sample in and sample out has changed
+negatively. The AUC for training is greater than AUC sample out but
+there is no significant over-fitting. The reduce in AUC for out sample
+could be due to the noise from random variables.
+
+## Selecting loans to invest in using the model Logistic 2.
+
+```{r}
+# splitting the data into training and testing
+set.seed(24)
+train_test_split <- initial_split(lc_clean, prop = 0.6)
+training <- training(train_test_split) #60% of the data is set aside for training
+remaining <- testing(train_test_split) #40% of the data is set aside for validation & testing
+set.seed(2024)
+train_test_split <- initial_split(remaining, prop = 0.5)
+validation<-training(train_test_split) #50% of the remaining data (20% of total data) will be used for validation
+testing<-testing(train_test_split) #50% of the remaining data (20% of total data) will be used for testing
+```
+
+```{r, eval = TRUE}
+#estimate the model on the training set
+# Train a logistic regression model (logistic2) to predict 'default' using specified predictors
+logistic2 <- glm(default ~ annual_inc + term + grade + loan_amnt, family = "binomial", data = training)
+
+# Make predictions on the validation set using the logistic2 model
+# 'type = "response"' returns predicted probabilities of default
+p_val <- predict(logistic2, validation, type = "response")
+
+# Define profit and loss per classification outcome
+unit_profit <- 15   # profit per correctly predicted non-default (TN)
+unit_loss <- 75     # loss per incorrectly predicted default (FP)
+
+# Initialize vectors to store profit and threshold values
+profit <- 0           # profit at each threshold
+threshold <- 0        # threshold values (from 0.0025 to 0.25, incremented by 0.0025)
+
+# Loop over 100 threshold values from 0.0025 to 0.25 in steps of 0.0025
+for(i in 1:100) {
+  # Calculate the current threshold value
+  threshold[i] <- i / 400
+  
+  # Classify predictions as 1 (default) or 0 (non-default) based on the current threshold
+  classify_one_or_zero <- ifelse(p_val > threshold[i], 1, 0)
+  
+  # Generate a confusion matrix to evaluate predictions against actual outcomes
+  cm <- confusionMatrix(as.factor(classify_one_or_zero), as.factor(validation$default), positive = "1")
+  
+  # Calculate profit: true negatives (cm$table[1,1]) yield profit; false positives (cm$table[1,2]) incur loss
+  profit[i] <- cm$table[1, 1] * unit_profit - cm$table[1, 2] * unit_loss
+}
+
+# Plot the profit curve over different threshold values
+ggplot(as.data.frame(threshold), aes(x = threshold, y = profit)) +
+  geom_smooth(method = 'loess', se = 0) +
+  labs(title = "Profit curve with random classifier")
+
+# Find the maximum profit and corresponding threshold
+profit_max <- max(profit)
+threshold_max <- threshold[which.max(profit)] * 100
+
+# Print the maximum profit and the optimal threshold as percentages
+print(profit_max)
+print(threshold_max)
+
+```
+
+```{r}
+# Generate predicted probabilities of default for the testing set using the logistic2 model
+p_test <- predict(logistic2, testing, type = "response")
+
+# Classify predictions as 1 (default) or 0 (non-default) based on a threshold of 16.5%
+classify_one_or_zero_test <- ifelse(p_test > 0.165, 1, 0)
+
+# Create a confusion matrix comparing predictions with actual default values in the testing set
+cm_test <- confusionMatrix(as.factor(classify_one_or_zero_test), as.factor(testing$default), positive = "1")
+
+# Calculate profit on the testing set:
+# Profit = (True Negatives * unit profit) - (False Positives * unit loss)
+profit_test <- cm_test$table[1, 1] * unit_profit - cm_test$table[1, 2] * unit_loss
+
+# Print the profit obtained on the testing set
+print(profit_test)
+
+```
+
+Insert your comments here: The threshold probability that generates
+maximum profit is **16.5** the corresponding profit generated is
+**31050.** The profit for test set is **16500.**
+
+```{r, eval = TRUE}
+#add code here
+# Classify observations in the validation set as 1 (default) or 0 (non-default) using a 16.5% threshold
+classify_mt <- ifelse(p_val > 0.165, 1, 0)
+
+# Initialize counters for missed non-defaults and total return on investment (ROI)
+misses <- 0    # Count of defaults that were incorrectly classified as non-defaults
+ROI <- 0       # Total ROI based on classifications
+counter <- 1   # Initialize a counter for row indexing in the loop
+
+# Loop through each classification result in 'classify_mt'
+for (i in classify_mt) {
+  
+  # Check if the classification is 0 (non-default) and the actual outcome in the validation set is also 0
+  if (i == 0 & validation[counter,]$default == 0) {
+    
+    # If correct non-default prediction, calculate return based on loan terms
+    # ROI is increased by ((term * installment amount / loan amount) - 1), which represents loan return
+    ROI <- ROI + ((((validation[counter,]$term_months * validation[counter,]$installment) / validation[counter,]$loan_amnt) - 1))
+  
+  # Check if classification is 0 (non-default) but actual outcome is 1 (default)
+  } else if (i == 0 & validation[counter,]$default == 1) {
+    
+    # If incorrect non-default prediction, apply a fixed loss of 60% of the loan amount
+    ROI <- ROI - 0.6
+    
+    # Increase the 'misses' counter to record the misclassification
+    misses <- misses + 1
+  }
+  
+  # Move to the next row in the validation set
+  counter <- counter + 1
+}
+
+# Calculate the average ROI as a percentage
+avg_ROI <- (ROI / nrow(validation)) * 100
+
+# Print the average ROI as a percentage
+print(avg_ROI)
+
+
+```
+
+The average return after investing \$1 on all investments is **11.11%**
+
+```{r, eval = TRUE}
+#add code here
+# Define a function 'avg_return' that calculates the average return on investment (ROI)
+# given a specific cost added to the default scenario
+avg_return <- function(cost) {
+  
+  # For each loan in the validation set, calculate 'loan_return' based on whether there was a default
+  # - If no default (default == "0"), return = (installment * term months / loan amount) - 1, indicating profit
+  # - If default (default == "1"), return = -0.6 - cost, where -0.6 is the standard loss and 'cost' is an additional fixed cost
+  validation <- validation %>%
+    mutate(loan_return = ifelse(default == "0", installment * term_months / loan_amnt - 1, -0.6 - cost))
+  
+  # Calculate the average ROI (avg_ROI) across all loans in the validation set
+  avg_ROI <- mean(validation$loan_return)
+  
+  # Return the average ROI value
+  return(avg_ROI)
+}
+
+# Define a range of cost values from 0 to 1 in increments of 0.01 to evaluate
+cost_range <- seq(0, 1, 0.01)
+
+# Apply the 'avg_return' function across each cost in 'cost_range' using 'sapply'
+# - This produces a vector 'avg_returns_values' of average ROI values for each cost in the range
+avg_returns_values <- sapply(cost_range, avg_return)
+
+# Identify the maximum cost for which the average ROI is still positive
+max_cost <- max(cost_range[avg_returns_values > 0])
+
+# Print the maximum allowable cost that maintains a positive average ROI
+print(max_cost)
+```
+
+A fixed cost of **\$0.74** for every missed prediction of default would
+still return a positive mean ROI. Further fixed cost, would result a
+negative ROI.
+
+```{r, eval = TRUE}
+#add code here 
+
+validation <- validation %>% 
+  mutate(exp_return = (installment*term_months/loan_amnt - 1)*(1-p_val) + (-0.6 * p_val))
+
+validation <- validation %>% 
+  mutate(prob_default = p_val)
+
+validation <- validation[order(-validation$exp_return), ]
+
+```
+
+```{r, eval = TRUE}
+n_values <- seq(1, nrow(validation), by = 1000) # Change in increments of 10 for efficiency
+realized_returns <- numeric(length(n_values))
+
+# Calculate realized return for the top n loans
+for (j in 1:length(n_values)) {
+  n <- n_values[j]
+  ROI <- 0
+  
+  for (i in 1:n) {
+    if (validation[i, ]$default == 0 & validation[i, ]$prob_default <= 16.5) {
+      # Non-default: Calculate ROI based on actual return
+      ROI <- ROI + ((validation[i, ]$term_months * validation[i, ]$installment) / validation[i, ]$loan_amnt - 1)
+    } else if (validation[i, ]$default == 1 & validation[i, ]$prob_default <= 16.5){
+      # Default: Apply the -60% loss
+      ROI <- ROI - 0.6
+    }
+  }
+  
+  # Store the average ROI for the top n loans
+  realized_returns[j] <- ROI / n
+}
+  
+df <- data.frame(n = n_values, realized_return = realized_returns)
+ggplot(df, aes(x = n, y = realized_return)) +
+  geom_line() +
+  labs(title = "Realized Return as Portfolio Size (n) Changes",
+       x = "Portfolio Size (n)",
+       y = "Realized Return")
+```
+
+```{r}
+profit_700 = 0
+for (i in 1:700) {
+  if (validation[i, ]$default == 0) {
+    profit_700 <- profit_700 + ((validation[i, ]$term_months * validation[i, ]$installment) / validation[i, ]$loan_amnt - 1)
+  } else{
+    profit_700 <- profit_700 - 0.6
+  }
+}
+
+# Print the profit for n=700
+print(profit_700)
+```
+
+For n=700, the profit is **147.1138**. As n increases, the the profit
+increases. However, we need to be careful while increasing n, as it
+might also start including loans with negative expected_return. The
+profit increases until n \< index of negative expected_return.
+
+```{r, eval = TRUE}
+#add code here
+calculate_profit_per_loss <- function(loss_rate) {
+  profit = 0
+  for (i in 1:700) {
+    if (validation[i, ]$default == 0 & validation[i, ]$prob_default <= 16.5) {
+      profit <- profit + ((validation[i, ]$term_months * validation[i, ]$installment) / validation[i, ]$loan_amnt - 1)
+    } else if (validation[i, ]$default == 1 & validation[i, ]$prob_default <= 16.5) {
+      profit <- profit - loss_rate
+    }
+  }
+  
+  return(profit)
+}
+
+loss_range <- seq(0.3, 0.9, 0.1)
+profit_per_loss_values <- sapply(loss_range, calculate_profit_per_loss)
+
+
+loss_vs_profit <- tibble(
+  loss_rate = seq(0.3, 0.9, 0.1),
+  profit = round(profit_per_loss_values, 2)
+)
+
+print(loss_vs_profit)
+```
+
+The profit reduces, as the loss percentage increases. Hence, the profit
+is sensitive and inversely related to loss.
+
+```{r}
+
+# Convert columns to factors and create a binary default character variable
+lc_clean <- lc_clean %>%
+  mutate(
+    def_chr = as.factor(ifelse(default == "1", "D", "P")),  # "D" for default, "P" for paid
+    term = factor(term),                                     # Convert 'term' to a factor
+    grade = factor(grade),                                   # Convert 'grade' to a factor
+    home_ownership = factor(home_ownership),                 # Convert 'home_ownership' to a factor
+    emp_length = factor(emp_length)                          # Convert 'emp_length' to a factor
+  )
+
+# Create additional feature columns for modeling
+lc_clean <- lc_clean %>% 
+  mutate(
+    income_loan_ratio = annual_inc / loan_amnt,              # Calculate income-to-loan ratio
+    log_inc = log(annual_inc + 1),                           # Log-transform of annual income
+    term_grade_intr = as.numeric(term) * as.numeric(grade),  # Interaction term between 'term' and 'grade'
+    inc_grade_intr = annual_inc * as.numeric(grade)          # Interaction term between income and 'grade'
+  )
+
+# Stratified random sampling based on loan 'grade'
+set.seed(121)
+train_indices <- createDataPartition(lc_clean$grade, p = 0.7, list = FALSE)  # 70% for training
+training <- lc_clean[train_indices, ]  # Training set
+testing <- lc_clean[-train_indices, ] 
+
+# Define formula for the logistic model
+formula <- def_chr ~ annual_inc + loan_amnt + income_loan_ratio + log_inc + term + grade + emp_length + inc_grade_intr + term_grade_intr
+
+# Create model matrix for training data and extract target variable
+X_train <- model.matrix(formula, data = training)[, -1]
+y_train <- training$def_chr
+
+# Fit LASSO model with cross-validation to select optimal lambda
+lasso_model <- cv.glmnet(X_train, y_train, alpha = 1, family = "binomial")
+
+# Extract the best lambda value based on minimum cross-validation error
+min_lambda <- lasso_model$lambda.min
+
+# Fit the LASSO model with the optimal lambda
+model_lasso <- glmnet(X_train, y_train, family = "binomial", alpha = 1, lambda = min_lambda)
+
+# Predict on the training set and calculate training AUC
+train_pred <- predict(model_lasso, newx = X_train, type = "response")
+train_roc <- roc(y_train, as.vector(train_pred))
+train_auc <- auc(train_roc)
+
+# Prepare testing data and calculate AUC for validation
+X_val <- model.matrix(formula, data = testing)[, -1]
+y_val <- as.numeric(as.character(testing$def_chr))
+
+# Predict on the validation set and calculate validation AUC
+val_pred <- predict(model_lasso, newx = X_val, type = "response")
+val_roc <- roc(y_train, as.vector(train_pred))
+val_auc <- auc(val_roc)
+
+# Display AUC for training and testing sets
+cat("AUC for LASSO model testing set:", val_auc, "\n")
+cat("AUC for LASSO model training set:", train_auc, "\n")
+
+
+
+
+```
+
+```{r}
+# Read the assessment data CSV file and create new features
+lc_assessment <- read_csv("D:\\data_science_business\\assignment2\\Assessment Data_2024.csv") %>%
+  mutate(
+    term = as.factor(`term (months)`),                       # Convert 'term' to factor
+    grade = as.factor(grade),                                # Convert 'grade' to factor
+    home_ownership = factor(home_ownership),                 # Convert 'home_ownership' to factor
+    emp_length = factor(emp_length),                         # Convert 'emp_length' to factor
+    income_loan_ratio = annual_inc / loan_amnt,              # Calculate income-to-loan ratio
+    log_inc = log(annual_inc + 1),                           # Apply log transformation to income
+    term_grade_intr = as.numeric(term) * as.numeric(grade),  # Interaction term: 'term' * 'grade'
+    inc_grade_intr = annual_inc * as.numeric(grade)          # Interaction term: income * 'grade'
+  )
+
+# Align factor levels in assessment data with training data for consistency
+lc_assessment$term <- factor(lc_assessment$term, levels = levels(training$term))
+lc_assessment$grade <- factor(lc_assessment$grade, levels = levels(training$grade))
+lc_assessment$home_ownership <- factor(lc_assessment$home_ownership, levels = levels(training$home_ownership))
+lc_assessment$emp_length <- factor(lc_assessment$emp_length, levels = levels(training$emp_length))
+
+# Define the model formula for prediction without the response variable
+predict_formula <- ~ annual_inc + loan_amnt + income_loan_ratio + log_inc + term + grade + emp_length + inc_grade_intr + term_grade_intr
+
+# Create a model matrix for assessment data to match the structure of training data
+X_asmnt <- model.matrix(predict_formula, data = lc_assessment)[, -1]
+
+# Identify missing columns in X_assessment and add them as zero columns for consistency
+missing_cols <- setdiff(colnames(X_train), colnames(X_asmnt))
+if (length(missing_cols) > 0) {
+  X_asmnt <- cbind(X_asmnt, Matrix(0, nrow = nrow(X_asmnt), ncol = length(missing_cols)))
+  colnames(X_asmnt)[(ncol(X_asmnt) - length(missing_cols) + 1):ncol(X_asmnt)] <- missing_cols
+}
+
+# Ensure column order in X_assessment matches that in X_train
+X_asmnt <- X_asmnt[, colnames(X_train)]
+
+# Predict default probabilities using the trained LASSO model
+predict_probs <- predict(model_lasso, newx = X_asmnt, type = "response")
+
+# Calculate expected returns for each loan in the assessment data
+lc_assessment <- lc_assessment %>%
+  mutate(
+    predicted_prob = as.vector(predict_probs),               # Store predicted probabilities
+    installment = as.numeric(installment),                   # Convert 'installment' to numeric
+    term_months = as.numeric(`term (months)`),               # Convert 'term' to numeric
+    loan_amnt = as.numeric(loan_amnt),                       # Convert 'loan_amnt' to numeric
+    return_if_paid = (installment * term_months) / loan_amnt - 1, # Expected return if loan is paid in full
+    return_if_default = -0.6,                                # Expected return if loan defaults
+    expected_return = return_if_paid * (1 - predict_probs) + return_if_default * predict_probs # Calculate expected return
+  )
+
+# Select the top 240 loans based on expected return
+selected_loans <- lc_assessment %>%
+  arrange(desc(expected_return)) %>%                         # Sort loans by expected return
+  slice_head(n = 240) %>%                                    # Select top 240 loans
+  mutate(roopa_yashaswini = 1) %>%                           # Label selected loans with 1
+  select(`Loan number`, roopa_yashaswini)
+
+# Label remaining (non-selected) loans with 0
+non_selected_loans <- lc_assessment %>%
+  filter(!`Loan number` %in% selected_loans$`Loan number`) %>% # Filter non-selected loans
+  mutate(roopa_yashaswini = 0) %>%                           # Label non-selected loans with 0
+  select(`Loan number`, roopa_yashaswini)
+
+# Combine selected and non-selected loans, keeping original order
+final_selection <- bind_rows(selected_loans, non_selected_loans) %>%
+  arrange(`Loan number`) %>%                                 # Arrange by loan number
+  rename(loan_number = `Loan number`)                        # Rename column for output
+
+# Save the final selection to a CSV file
+write.csv(final_selection, "Roopa_Yashaswini.csv", row.names = FALSE)
+
+```
+
+```{r, eval = TRUE}
+lc_assessment<- read_csv("Assessment Data_2024.csv") %>%  #load the data 
+  clean_names() %>% # use janitor::clean_names() 
+  mutate(
+    issue_d = mdy(issue_d),  # lubridate::mdy() to fix date format
+    term = factor(term_months),     # turn 'term' into a categorical variable
+    delinq_2yrs = factor(delinq_2yrs)) # turn 'delinq_2yrs' into a categorical variable
+```
